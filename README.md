@@ -5,8 +5,6 @@ This is the official implementaion of paper " Label-Efficient Hybrid-Supervised 
 
 This repository contains PyTorch training and evaluation code for Pascal VOC 2012 and COCO dataset.
 
-
-
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
 python -m torch.distributed.launch --nproc_per_node=2 train_xx.py --config configs/xx.yaml
