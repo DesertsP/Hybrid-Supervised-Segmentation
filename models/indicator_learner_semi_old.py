@@ -1,0 +1,304 @@
+import torch
+import torch.nn as nn
+from utils import build_module
+from models.mods.ops import set_requires_grad, resize_as, update_model_moving_average, copy_parameters,\
+    label_onehot, singleton, weighted_gather, generate_mix_masks
+import einops
+from kornia import augmentation as augs
+import numpy as np
+from backpack import extend, backpack
+from backpack.extensions import BatchGrad
+import copy
+import torch.distributed as dist
+
+
+class IndicatorLearner(nn.Module):
+    def __init__(self, num_classes, num_samples, indicator_initialization=0.0, ema_decay=0.99,
+                 use_online_pseudo=True,
+                 pseudo_augment='cutmix',
+                 pseudo_keep_ratio=100,
+                 pseudo_augment_prob=1.0,
+                 hyper_criterion_cfg=None,
+                 network_cfg: dict = None,
+                 hessian_type='identity',
+                 ignore_index=255):
+        super().__init__()
+        self.use_online_pseudo = use_online_pseudo
+        self.pseudo_augment = pseudo_augment
+        self.pseudo_augment_prob = pseudo_augment_prob
+        self.pseudo_keep_ratio = pseudo_keep_ratio
+        self.online_net = build_module(**network_cfg)
+        self.target_net = build_module(**network_cfg)
+        for t_p, o_p in zip(self.target_net.parameters(), self.online_net.parameters()):
+            t_p.data.copy_(o_p.data)
+        set_requires_grad(self.target_net, False)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none')
+
+        NORMALIZE = augs.Normalize(mean=torch.tensor((0.485, 0.456, 0.406)),
+                                   std=torch.tensor((0.229, 0.224, 0.225)))
+        STRONG_AUG = nn.Sequential(
+            augs.ColorJitter(0.5, 0.5, 0.5, 0.25, p=0.8),
+            augs.RandomGrayscale(p=0.2),
+            augs.RandomGaussianBlur((3, 3), (0.1, 2.0), p=0.5),
+            augs.RandomSolarize(p=0.1),
+            NORMALIZE
+        )
+        DEFAULT_AUG = NORMALIZE
+        self.augment = DEFAULT_AUG
+        self.strong_augment = STRONG_AUG
+        self.normalize = NORMALIZE
+        self.num_classes = num_classes
+        self.ema_decay = ema_decay
+        # for per-sample weight learning, hack the backprop. to obtain gradients w.r.t each sample
+        indicators = torch.ones(num_samples, num_classes) * indicator_initialization
+        self.register_buffer('indicators', indicators)
+        # unbiased gradient cache
+        unbiased_grad = torch.zeros(self.online_net.classification_loss.out_channels * self.online_net.classification_loss.in_channels)
+        self.register_buffer('unbiased_grad', unbiased_grad)
+        self.proxy_classifier = None
+        self.proxy_criterion = extend(nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none'))
+        if hyper_criterion_cfg is None:
+            self.hyper_criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        else:
+            self.hyper_criterion = build_module(**hyper_criterion_cfg)
+        self.hessian_type = hessian_type
+        self.ignore_index = ignore_index
+
+    @singleton('proxy_classifier')
+    def get_proxy_classifier(self):
+        proxy_classifier = copy.deepcopy(self.online_net.classification_loss)
+        proxy_classifier = extend(proxy_classifier)
+        return proxy_classifier
+
+    @torch.no_grad()
+    def extract_feature(self, image):
+        x = self.normalize(image)
+        x = self.online_net.backbone(x)
+        x = self.online_net.decoder(x)
+        x = self.online_net.projector(x)
+        return x.detach()
+
+    def grad_classifier(self, image, target, zero_grad=False, accumulate_iters=1):
+        """
+        Compute holistic gradients w.r.t classifier weights.
+        Returns:
+        """
+        x = self.extract_feature(image)
+        classifier = self.get_proxy_classifier()
+        if zero_grad:       # aggregate grad if False
+            classifier = copy_parameters(classifier, self.online_net.classification_loss)
+            classifier.zero_grad()
+        pred = classifier(x)
+        loss = (1 / accumulate_iters) * self.hyper_criterion(resize_as(pred, target), target)
+        loss.backward()
+        grad_w = classifier.weight.grad.detach().clone()
+        grad_b = classifier.bias.grad.detach().clone()
+        grad = torch.cat([grad_w.reshape(-1), grad_b])
+        return grad
+
+    def grad_per_region_classifier(self, image, target, update_parameters=False):
+        """
+        Compute per-region gradients w.r.t classifier weights.
+        For coarse/weakly labeled data point, we can use the coarse labels to compute loss.
+        For unlabeled data, we can consider the regularization/pseudo-label loss.
+        Returns: per-regional gradients
+        NOTE:
+            BackPACK does not aggregate/accumulate grad like PyTorch.
+            Every call to .backward(), inside a with backpack(...):, reset the corresponding field,
+            and the fields returned by BackPACK are not affected by zero_grad().
+        """
+        x = self.extract_feature(image)
+        classifier = self.get_proxy_classifier()
+        if update_parameters:
+            copy_parameters(classifier, self.online_net.classification_loss)
+        classifier.zero_grad()  # zero_grad & update_parameters are unnecessary
+
+        b, c, h, w = x.shape
+        representations = einops.rearrange(x, 'b c h w -> (b h w) c 1 1')
+        pred = classifier(representations)
+        pred = einops.rearrange(pred, '(b h w) c 1 1 -> b c h w', b=b, h=h, w=w)
+
+        loss = self.proxy_criterion(resize_as(pred, target), target).sum()
+        with backpack(BatchGrad()):
+            loss.backward()
+        grad_w = classifier.weight.grad_batch.detach().clone()
+        grad_b = classifier.bias.grad_batch.detach().clone()
+        with torch.no_grad():
+            grad_w = einops.rearrange(grad_w, '(b h w) o i 1 1-> b (o i) h w', b=b, h=h, w=w)
+            grad_b = einops.rearrange(grad_b, '(b h w) o -> b o h w', b=b, h=h, w=w)
+            grad = torch.cat([grad_w, grad_b], dim=1)
+            target_oh = label_onehot(target, self.num_classes)
+            target_oh = resize_as(target_oh.float(), grad, mode='nearest', align_corners=None)
+            grad_region = weighted_gather(grad, target_oh)     # (b, #regions, k)
+        return grad_region
+
+    def compute_influence(self, image, target):
+        unbiased_grad = self.unbiased_grad.unsqueeze(0)     # (1,i*o)
+        grad_per_region = self.grad_per_region_classifier(image, target)
+
+        if self.hessian_type == 'identity':
+            influence = -unbiased_grad.matmul(einops.rearrange(grad_per_region, 'b c k -> k (b c)'))
+        else:
+            # compute / estimate inverse Hessian
+            h_ = self.hessian_classifier(image, target)
+            h_inv = h_.inverse()
+            influence = -unbiased_grad.matmul(h_inv).matmul(einops.rearrange(grad_per_region, 'b c k -> k (b c)'))
+        influence = einops.rearrange(influence, '1 (b r) ->  b r', b=grad_per_region.size(0), r=grad_per_region.size(1))
+        return influence
+
+    @torch.no_grad()
+    def sync_indicators(self, indicator_grad, index):
+        process_group = dist.group.WORLD
+        world_size = dist.get_world_size(process_group)
+        if world_size <= 1:
+            return
+        index_all = torch.empty(world_size, *index.size(), dtype=index.dtype, device=index.device)
+        indicator_grad_all = torch.empty(world_size, *indicator_grad.size(),
+                                         dtype=indicator_grad.dtype, device=indicator_grad.device)
+        index_l = list(index_all.unbind(0))
+        indicator_grad_l = list(indicator_grad_all.unbind(0))
+        index_gather = dist.all_gather(index_l, index, process_group, async_op=False)
+        indicator_gather = dist.all_gather(indicator_grad_l, indicator_grad, process_group, async_op=False)
+        for idx, val in zip(index_l, indicator_grad_l):
+            self.indicators.grad[idx] = val
+
+    @torch.no_grad()
+    def sync_unbiased_grad(self):
+        process_group = dist.group.WORLD
+        world_size = dist.get_world_size(process_group)
+        unbiased_grad_all = torch.empty(world_size, self.unbiased_grad.size(0),
+                                        dtype=self.unbiased_grad.dtype, device=self.unbiased_grad.device)
+        unbiased_grad_l = list(unbiased_grad_all.unbind(0))
+        dist.all_gather(unbiased_grad_l, self.unbiased_grad,
+                        process_group, async_op=False)
+        _mean = torch.stack(unbiased_grad_l, dim=0).mean(0)
+        self.unbiased_grad.data.copy_(_mean.data)
+
+    def compute_unbiased_grad(self, image, target, zero_grad=False, sync=False, accumulate_iters=1):
+        grads = self.grad_classifier(image, target, zero_grad=zero_grad, accumulate_iters=accumulate_iters)
+        self.unbiased_grad.data = grads.data
+        if sync:
+            self.sync_unbiased_grad()
+        return grads
+
+    def compute_indicator_grad(self, image, target=None, index=None, sync=True):
+        assert index is not None
+        if target is None:
+            target = self.forward_pseudo_label(image)
+        influence = self.compute_influence(image, target)
+        if self.indicators.grad is None:
+            self.indicators.grad = torch.zeros_like(self.indicators)
+        assert index.size(0) == influence.size(0)
+        if sync:
+            self.sync_indicators(influence, index)
+        else:
+            self.indicators.grad[index] = influence
+        return influence
+
+    def hessian_classifier(self, image, target):
+        """
+        TODO: The complexity of calculating the Hessian matrix directly is terrible.
+        """
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def forward_pseudo_label(self, image):
+        # generate pseudo labels first
+        image = self.normalize(image)
+        # self.target_net.train()
+        pred_u_teacher = self.target_net(image)["pred"]
+        pred_u_teacher = resize_as(pred_u_teacher, image)
+        pred_u_teacher = pred_u_teacher.softmax(dim=1)
+        logits_u, label_u = torch.max(pred_u_teacher, dim=1)
+        # filter out high entropy pixels
+        if self.pseudo_keep_ratio < 100:
+            entropy = -torch.sum(pred_u_teacher * torch.log(pred_u_teacher + 1e-10), dim=1)
+            thresh = np.percentile(entropy.flatten().detach().cpu().numpy(), self.pseudo_keep_ratio)
+            thresh_mask = entropy.ge(thresh).bool() * (label_u != 255).bool()
+            label_u[thresh_mask] = 255
+        return label_u
+
+    def apply_augmentation(self, image, target, index, mix_mask=None):
+        if mix_mask is None:
+            mix_mask = generate_mix_masks(image, target, mode=self.pseudo_augment)
+        indicator = self.indicators[index]  # (b, c)
+        indicator_p = label_onehot(target, self.num_classes)
+        indicator_p = indicator_p * einops.rearrange(indicator, 'b c -> b c 1 1')  # (b,c,h,w) * (b,c)
+        indicator_p = indicator_p.sum(dim=1)
+        mix_mask_unsqz = mix_mask.unsqueeze(1)
+        image = image * mix_mask_unsqz + image.roll(-1, dims=0) * (1 - mix_mask_unsqz)
+        target = target * mix_mask + target.roll(-1, dims=0) * (1 - mix_mask)
+        target = target.long()
+        indicator_p = indicator_p * mix_mask + indicator_p.roll(-1, dims=0) * (1 - mix_mask)
+        return image, target, indicator_p
+
+    def forward_train(self, image, target, image_u, target_u, index_u):
+        mix_mask = generate_mix_masks(image_u, target_u, mode=self.pseudo_augment)
+        if self.use_online_pseudo:      # for additional regularization
+            target_u_ps = self.forward_pseudo_label(image_u)
+            target_u_ps = target_u_ps * mix_mask + target_u_ps.roll(-1, dims=0) * (1 - mix_mask)
+            target_u_ps = target_u_ps.long()
+        image_u, target_u, indicator_u = self.apply_augmentation(image_u, target_u, index_u, mix_mask)
+
+        image = self.augment(image)
+        image_u = self.strong_augment(image_u)
+        image_all = torch.cat([image, image_u], dim=0)
+        outputs = self.online_net(image_all)
+        pred_all = outputs['pred']
+        num_labeled, num_unlabeled = image.size(0), image_u.size(0)
+        pred, pred_u = torch.split(pred_all, [num_labeled, num_unlabeled], dim=0)
+
+        # fully supervised loss
+        sup_loss = self.criterion(resize_as(pred, image), target).mean()
+
+        # weakly / coarse supervised loss
+        weak_loss = self.criterion(resize_as(pred_u, image_u), target_u)
+        weak_loss *= indicator_u
+        weak_loss = weak_loss.mean()
+
+        # regularization (pseudo) loss
+        if self.use_online_pseudo:
+            pseudo_loss = self.criterion(resize_as(pred_u, image_u), target_u_ps)
+            pseudo_loss *= indicator_u
+            pseudo_loss = pseudo_loss.mean()
+            # rescale
+            b, h, w = target_u.shape
+            scale_factor = b*h*w / torch.sum(target_u != 255)
+            pseudo_loss *= scale_factor
+        else:
+            pseudo_loss = 0.0
+        # moving average
+        update_model_moving_average(self.ema_decay, self.target_net, self.online_net)
+        return dict(seg_loss=sup_loss, weak_loss=weak_loss, reg_loss=pseudo_loss)
+
+    def forward_test(self, input):
+        x = self.normalize(input)
+        pred = self.online_net(x)
+        return pred
+
+    def forward(self, *args, mode=0, **kwargs):
+        if mode == 1:
+            assert self.training
+            return self.forward_train(*args, **kwargs)
+        elif mode == 2:
+            return self.compute_unbiased_grad(*args, **kwargs)
+        elif mode == 3:
+            return self.compute_indicator_grad(*args, **kwargs)
+        else:
+            return self.forward_test(*args, **kwargs)
+
+    def parameter_groups(self):
+        groups = ([], [])
+        backbone = [self.online_net.backbone]
+        newly_added = [self.online_net.decoder,
+                       self.online_net.projector,
+                       self.online_net.classification_loss
+                       ]
+        for module in backbone:
+            for p in module.parameters():
+                groups[0].append(p)
+        for module in newly_added:
+            for p in module.parameters():
+                groups[1].append(p)
+        assert len(list(self.parameters())) == 2 * sum([len(g) for g in groups])
+        return groups

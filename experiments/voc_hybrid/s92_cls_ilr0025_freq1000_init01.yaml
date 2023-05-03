@@ -1,0 +1,69 @@
+misc:
+  log_freq: 50
+  verbose: 1
+  debug: false
+  resume: ''
+  eval_freq: 1
+  seed: 2
+train:
+  num_epochs: 40
+  batch_size: 16
+  batch_size_unsup: 16
+  indicator_batch_size: 32
+  indicator_update_from_iter: 1000
+  indicator_update_freq: 1000
+  num_workers: 8
+  loss_coefficient:
+    seg_loss: 1.0
+    reg_loss: 0.5
+    weak_loss: 0.5
+  optimizer:
+    name: torch.optim.SGD
+    lr: 0.001
+    momentum: 0.9
+    weight_decay: 0.0001
+  lr_scheduler:
+    name: utils.lr_helper.LRScheduler
+    mode: poly
+    lr_args:
+      power: 0.9
+  indicator_optimizer:
+    name: utils.custom_optm.AdamWeightUpdate
+    lr: 0.025
+    clamp_max: 1.0
+    clamp_min: 0.0
+trainset:
+  name: datasets.voc_v5_idx.voc_trainset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/92/labeled.txt
+trainset_unsup:
+  name: datasets.voc_v5_idx.voc_trainset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/92/unlabeled.txt
+  label_dir: SLRNetPseudo/ImageLevel
+valset:
+  name: datasets.voc_v5_idx.voc_valset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/val.txt
+model:
+  name: models.indicator_learner_hybrid.IndicatorLearner
+  num_classes: 21
+  indicator_initialization: 0.1
+  num_samples: 10582
+  ema_decay: 0.99
+  pseudo_augment: cutmix
+  pseudo_keep_ratio: 100
+  pseudo_augment_prob: 1.0
+  network_cfg:
+    name: models.deeplab2.DeepLab
+    num_classes: 21
+    backbone_cfg:
+      name: models.backbones.resnet.resnet101
+      pretrained: /workspace/pretrained/resnet101.pth
+      replace_stride_with_dilation: [false, true, true]
+      zero_init_residual: true
+      multi_grid: true
+    decoder_cfg:
+      name: models.mods.aspp.ASPPDecoder
+    norm_cfg:
+      name: torch.nn.SyncBatchNorm

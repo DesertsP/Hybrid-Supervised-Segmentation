@@ -1,0 +1,48 @@
+misc:
+  log_freq: 20
+  verbose: 1
+  debug: false
+  resume: ''
+  eval_freq: 1
+  seed: 2
+train:
+  num_epochs: 20
+  batch_size: 8
+  num_workers: 4
+  loss_coefficient:
+    seg_loss: 1.0
+    reg_loss: 1.0
+  optimizer:
+    name: torch.optim.SGD
+    lr: 0.001
+    momentum: 0.9
+    weight_decay: 0.0001
+  lr_scheduler:
+    name: utils.lr_helper.LRScheduler
+    mode: poly
+    lr_args:
+      power: 0.9
+trainset:
+  name: datasets.coco_idx.coco_trainset
+  root: /workspace/data/COCO2017
+  split: /workspace/data/splits/coco/20k/labeled.txt
+valset:
+  name: datasets.coco_idx.coco_valset
+  root: /workspace/data/COCO2017
+  split: /workspace/data/splits/coco/val.txt
+model:
+  name: models.single_learner.SingleLearner
+  use_augment: false
+  network_cfg:
+    name: 'models.deeplab.DeepLab'
+    num_classes: 21
+    backbone_cfg:
+      name: 'models.backbones.resnet.resnet101'
+      pretrained: '/workspace/pretrained/resnet101.pth'
+      replace_stride_with_dilation: [false, true, true]
+      zero_init_residual: true
+      multi_grid: true
+    decoder_cfg:
+      name: 'models.mods.aspp.ASPPDecoder'
+    norm_cfg:
+      name: 'torch.nn.SyncBatchNorm'

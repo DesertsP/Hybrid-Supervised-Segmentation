@@ -1,0 +1,54 @@
+misc:
+  log_freq: 20
+  verbose: 1
+  debug: false
+  resume: ''
+  eval_freq: 1
+  seed: 2
+train:
+  num_epochs: 30
+  batch_size: 16
+  batch_size_unsup: 16
+  indicator_batch_size: 32
+  indicator_update_from_iter: 99999999  # never used
+  indicator_update_freq: 20
+  num_workers: 4
+  loss_coefficient:
+    seg_loss: 1.0
+  optimizer:
+    name: torch.optim.SGD
+    lr: 0.001
+    momentum: 0.9
+    weight_decay: 0.0001
+  lr_scheduler:
+    name: utils.lr_helper.LRScheduler
+    mode: poly
+    lr_args:
+      power: 0.9
+trainset:
+  name: datasets.voc_v5_idx.voc_trainset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/183/labeled.txt
+trainset_unsup:
+  name: datasets.voc_v5_idx.voc_trainset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/183/unlabeled.txt
+  label_dir: SLRNetPseudo/ImageLevel
+valset:
+  name: datasets.voc_v5_idx.voc_valset
+  root: /workspace/data/VOC2012
+  split: /workspace/data/splits/pascal/val.txt
+model:
+  name: models.simple_mix.SimpleMixLearner
+  backbone_cfg:
+    name: models.backbones.resnet.resnet101
+    pretrained: /workspace/pretrained/resnet101.pth
+    replace_stride_with_dilation: [ false, true, true ]
+    zero_init_residual: true
+    multi_grid: true
+  norm_cfg:
+    name: torch.nn.SyncBatchNorm
+  decoder_cfg:
+    name: models.mods.aspp.ASPPDecoder
+  num_classes: 21
+  supervised_only: true

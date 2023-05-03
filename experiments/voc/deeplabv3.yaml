@@ -1,0 +1,43 @@
+misc:
+  log_dir: 'outputs'
+  log_freq: 100
+  verbose: 1
+  debug: false
+  resume: ''
+  visualize: true
+  visualize_samples: ''
+  save_from_epoch: 12
+train:
+  num_epochs: 80
+  batch_size: 8
+  num_workers: 8
+  optimizer:
+    name: torch.optim.SGD
+    lr: 0.001     # 2GPUs
+    momentum: 0.9
+    weight_decay: 0.0001
+  lr_scheduler:
+    mode: poly
+    kwargs:
+      power: 0.9
+trainset:
+  name: datasets.voc_segmentation.voc_trainset
+  root: '/home/pjw/data/voc12/VOCdevkit/VOC2012'
+  split: '/home/pjw/data/voc12/train.txt'
+valset:
+  name: datasets.voc_segmentation.voc_valset
+  root: '/home/pjw/data/voc12/VOCdevkit/VOC2012'
+  split: '/home/pjw/data/voc12/val.txt'
+model:
+  name: 'models.deeplab.DeepLab'
+  num_classes: 21
+  backbone_cfg:
+    name: 'models.backbones.resnet.resnet101'
+    pretrained: '/home/pjw/pretrained/resnet101.pth'
+    replace_stride_with_dilation: [false, true, true]
+    zero_init_residual: true
+    multi_grid: true
+  decoder_cfg:
+    name: 'models.mods.aspp.ASPPDecoder'
+  norm_cfg:
+    name: 'torch.nn.SyncBatchNorm'
